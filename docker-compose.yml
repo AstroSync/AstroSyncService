@@ -1,0 +1,130 @@
+version: '3.8'
+services:
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - '--providers.docker=true'
+      - '--log.LEVEL=INFO'
+      - '--entryPoints.http.address=:80'
+      - '--entryPoints.http.forwardedHeaders.insecure'
+      - '--entryPoints.http.proxyProtocol.insecure'
+
+  postgres:
+    image: postgres:latest
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRE_DB?Variable not set}
+      POSTGRES_USER: ${POSTGRE_DB_USER?Variable not set}
+      POSTGRES_PASSWORD: ${POSTGRE_DB_PASSWORD?Variable not set}
+    volumes:
+      - './Keycloak/db:/var/lib/postgresql/data'
+    restart: always
+
+  keycloak:
+    image: jboss/keycloak:latest
+    container_name: keycloak
+    volumes:
+      - ./Keycloak/realm-export.json:/opt/jboss/keycloak/imports/realm-export.json
+    command:
+      - '-b 0.0.0.0 -Dkeycloak.profile.feature.upload_scripts=enabled -Dkeycloak.import=/opt/jboss/keycloak/imports/realm-export.json'
+    environment:
+      DB_VENDOR: POSTGRES
+      DB_ADDR: postgres
+      DB_DATABASE: ${POSTGRE_DB?Variable not set}
+      DB_USER: ${POSTGRE_DB_USER?Variable not set}
+      DB_SCHEMA: public
+      DB_PASSWORD: ${POSTGRE_DB_PASSWORD?Variable not set}
+      KEYCLOAK_USER: ${KEYCLOAK_USER?Variable not set}
+      KEYCLOAK_PASSWORD: ${KEYCLOAK_PASSWORD?Variable not set}
+      PROXY_ADDRESS_FORWARDING: 'true'
+    depends_on:
+      - postgres
+    restart: always
+    labels:
+      - 'traefik.enable=true'
+      - 'traefik.http.routers.keycloak.rule=PathPrefix(`/auth`)'
+      - 'traefik.http.routers.keycloak.service=keycloak'
+      - 'traefik.http.routers.keycloak.entrypoints=http'
+      - "traefik.http.middlewares.keycloak-stripprefix.stripprefix.prefixes=/auth"
+      - 'traefik.http.routers.keycloak.middlewares=keycloak-stripprefix'
+      - 'traefik.http.services.keycloak.loadbalancer.server.port=8080'
+      - 'traefik.http.services.keycloak.loadbalancer.passhostheader=true'
+      - 'traefik.http.routers.keycloak.middlewares=compresstraefik'
+      - 'traefik.http.middlewares.compresstraefik.compress=true'
+
+  frontend:
+    image: astrosync_frontend:latest
+    container_name: astrosync_frontend
+    build:
+      context: ./WebServer/
+    environment:
+      PROJECT_NAME: ${PROJECT_NAME?Variable not set}
+      DOMAIN: ${DOMAIN?Variable not set}
+      API_URL: ${API_URL?Variable not set}
+      AUTH_URL: ${AUTH_URL?Variable not set}
+      REALM: ${REALM?Variable not set}
+      CLIENT_ID: ${CLIENT_ID?Variable not set}
+      SSL: ${SSL?Variable not set}
+
+    labels:
+      - 'traefik.enable=true'
+      - 'traefik.http.routers.frontend.rule=Host(`${DOMAIN?Variable not set}`)'
+      - 'traefik.http.routers.frontend.priority=1'
+      - 'traefik.http.routers.frontend.entrypoints=http'
+      - 'traefik.http.routers.frontend.service=frontend_service'
+      - 'traefik.http.services.frontend_service.loadbalancer.server.port=8082'
+      - 'traefik.http.services.frontend_service.loadbalancer.passhostheader=true'
+
+    volumes:
+      - ./WebServer/src:/frontend/src
+
+  backend:
+    image: backend:latest
+    container_name: astrosync_api_server
+    build:
+      context: ./API_Server/
+    environment:
+      DOMAIN: ${DOMAIN?Variable not set}
+      MONGO_HOST: ${MONGO_HOST?Variable not set}
+      MONGO_USERNAME: ${MONGO_USERNAME?Variable not set}
+      MONGO_PASSWORD: ${MONGO_PASSWORD?Variable not set}
+      AUTH_URL: ${AUTH_URL?Variable not set}
+      REALM: ${REALM?Variable not set}
+      CLIENT_ID: ${CLIENT_ID?Variable not set}
+      ADMIN_SECRET: ${ADMIN_SECRET?Variable not set}
+    depends_on:
+      - "keycloak"
+      - "mongodb"
+    volumes:
+      - ./API_Server/:/api_server
+    restart: on-failure:25
+
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik_default"
+      - "traefik.http.routers.backend.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.backend.entrypoints=http"
+      - "traefik.http.middlewares.backend-stripprefix.stripprefix.prefixes=/api"
+      - 'traefik.http.routers.backend.middlewares=backend-stripprefix'
+      - "traefik.http.services.backend_service.loadbalancer.passhostheader=true"
+      - "traefik.http.services.backend_service.loadbalancer.server.port=8086"
+
+  mongodb:
+    image: mongo:4.4.6
+    container_name: mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME?Variable not set}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD?Variable not set}
+    ports:
+      - 27017:27017
+    volumes:
+      - ./API_Server/db:/data/db
+    command: mongod --quiet --logpath /dev/null
